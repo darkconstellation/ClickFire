@@ -21,6 +21,7 @@ db = client[MONGO_DB]
 users_col = db["users"]
 albums_col = db["albums"]
 album_files_col = db["album_files"]
+push_subscriptions_col = db["push_subscriptions"]
 
 # Per-room message collections
 ROOM_COLLECTIONS = {

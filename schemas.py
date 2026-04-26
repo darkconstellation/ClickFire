@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import datetime
 from enum import Enum
 
@@ -59,6 +59,13 @@ class MessageResponse(BaseModel):
 class StatusUpdate(BaseModel):
     message_ids: List[str]
     status: MessageStatus
+
+
+# --- Push Notifications ---
+
+class PushSubscriptionCreate(BaseModel):
+    user_id: str
+    subscription: dict[str, Any]
 
 
 # --- Albums ---

@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -13,12 +15,21 @@ import os
 import shutil
 from urllib.parse import quote, unquote
 
-from database import db, users_col, albums_col, album_files_col, get_messages_col, ROOM_COLLECTIONS
+from database import (
+    db,
+    users_col,
+    albums_col,
+    album_files_col,
+    push_subscriptions_col,
+    get_messages_col,
+    ROOM_COLLECTIONS,
+)
 from schemas import (
     UserLogin, UserResponse, MessageCreate, MessageResponse,
     StatusUpdate, MessageStatus, ReplyTo,
-    AlbumResponse, AlbumAuth, AlbumFileResponse, SaveToAlbum,
+    AlbumResponse, AlbumAuth, AlbumFileResponse, SaveToAlbum, PushSubscriptionCreate,
 )
+from push_notifications import get_vapid_public_key, send_web_push
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 VIDEO_DIR = os.path.join(UPLOAD_DIR, "videos")
@@ -200,6 +211,83 @@ def _album_file_to_response(doc: dict) -> dict:
     }
 
 
+def _build_message_notification_preview(
+    doc: dict, room: str, sender_username: str, unread_total: int
+) -> dict:
+    is_ping = doc.get("content") == "PING!"
+    is_media = bool(doc.get("is_media"))
+    content = doc.get("content") or ""
+
+    if is_ping:
+        title = f"{sender_username} sent a PING!" if sender_username else "PING!"
+        body = "PING!"
+    else:
+        if sender_username and unread_total > 1:
+            title = f"{sender_username} sent {unread_total} new messages"
+        else:
+            title = f"{sender_username} sent a message" if sender_username else "New message"
+        if is_media:
+            body = "Media message"
+        elif content:
+            body = content if len(content) <= 80 else f"{content[:80]}..."
+        else:
+            body = "New message"
+
+    return {
+        "room": room,
+        "message": _msg_doc_to_response(doc),
+        "sender_username": sender_username,
+        "title": title,
+        "body": body,
+        "is_ping": is_ping,
+        "url": f"/#/{room}",
+    }
+
+
+async def _latest_unread_notification(user_id: ObjectId):
+    unread_total = 0
+    latest_room = None
+    latest_doc = None
+
+    for room_name, col in ROOM_COLLECTIONS.items():
+        query = {"receiver_id": user_id, "status": {"$ne": "read"}}
+        unread_total += await col.count_documents(query)
+        docs = await col.find(query).sort("_id", -1).limit(1).to_list(length=1)
+        if not docs:
+            continue
+
+        doc = docs[0]
+        if latest_doc is None or doc["_id"] > latest_doc["_id"]:
+            latest_doc = doc
+            latest_room = room_name
+
+    if latest_doc is None or latest_room is None:
+        return {"unread_total": unread_total, "latest": None}
+
+    sender = await users_col.find_one({"_id": latest_doc["sender_id"]}, {"username": 1})
+    sender_username = sender["username"] if sender else ""
+    return {
+        "unread_total": unread_total,
+        "latest": _build_message_notification_preview(
+            latest_doc,
+            latest_room,
+            sender_username,
+            unread_total,
+        ),
+    }
+
+
+async def _send_push_notifications_for_user(user_id: ObjectId) -> None:
+    subscriptions = push_subscriptions_col.find({"user_id": str(user_id)})
+    async for subscription_doc in subscriptions:
+        try:
+            response = await asyncio.to_thread(send_web_push, subscription_doc["subscription"])
+            if response.status_code in {404, 410}:
+                await push_subscriptions_col.delete_one({"_id": subscription_doc["_id"]})
+        except Exception as error:
+            print(f"[Push] Failed to send notification: {error}")
+
+
 # --- lifespan (seed + indexes) ---
 
 @asynccontextmanager
@@ -208,6 +296,8 @@ async def lifespan(app_instance: FastAPI):
     await users_col.create_index("username", unique=True)
     await albums_col.create_index("name", unique=True)
     await album_files_col.create_index("album_id")
+    await push_subscriptions_col.create_index("endpoint", unique=True)
+    await push_subscriptions_col.create_index("user_id")
     for col in ROOM_COLLECTIONS.values():
         await col.create_index([("sender_id", 1), ("receiver_id", 1)])
 
@@ -295,6 +385,51 @@ async def get_unread_count(user_id: str, room: Optional[str] = None):
     return {"unread": count}
 
 
+@app.get("/push/vapid-public-key")
+async def get_push_public_key():
+    return {"public_key": get_vapid_public_key()}
+
+
+@app.post("/push/subscribe")
+async def subscribe_to_push(payload: PushSubscriptionCreate):
+    endpoint = payload.subscription.get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Missing push subscription endpoint")
+
+    doc = {
+        "user_id": payload.user_id,
+        "endpoint": endpoint,
+        "subscription": payload.subscription,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    existing = await push_subscriptions_col.find_one({"endpoint": endpoint})
+    if existing:
+        doc["created_at"] = existing.get("created_at", doc["updated_at"])
+        await push_subscriptions_col.update_one({"endpoint": endpoint}, {"$set": doc})
+    else:
+        doc["created_at"] = doc["updated_at"]
+        await push_subscriptions_col.insert_one(doc)
+
+    return {"ok": True}
+
+
+@app.delete("/push/subscribe")
+async def unsubscribe_from_push(user_id: str, endpoint: str):
+    result = await push_subscriptions_col.delete_one({"user_id": user_id, "endpoint": endpoint})
+    return {"ok": True, "deleted": result.deleted_count}
+
+
+@app.get("/notifications/latest/{user_id}")
+async def latest_notification(user_id: str):
+    try:
+        user_oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id")
+
+    payload = await _latest_unread_notification(user_oid)
+    return payload
+
+
 @app.get("/messages/{room}/{user_id}/{contact_id}", response_model=List[MessageResponse])
 async def get_messages(
     room: str,
@@ -348,6 +483,10 @@ async def send_message(room: str, sender_id: str, msg: MessageCreate):
         doc["reply_to"] = msg.reply_to.model_dump()
     result = await col.insert_one(doc)
     doc["_id"] = result.inserted_id
+    try:
+        await _send_push_notifications_for_user(ObjectId(msg.receiver_id))
+    except Exception as error:
+        print(f"[Push] Failed to enqueue push notification: {error}")
     return _msg_doc_to_response(doc)
 
 
