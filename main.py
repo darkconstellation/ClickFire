@@ -4,9 +4,14 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime, timezone
+import base64
+import binascii
 from bson import ObjectId
+import hashlib
+import hmac
 import os
 import shutil
+from urllib.parse import quote, unquote
 
 from database import db, users_col, albums_col, album_files_col, get_messages_col, ROOM_COLLECTIONS
 from schemas import (
@@ -22,15 +27,76 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR, exist_ok=True)
 
+CHAT_ROOM_UPLOAD_FOLDERS = {
+    "private": "Private",
+    "work": "Work",
+    "testing": "Testing",
+}
+
+ALBUM_PASSWORD_HASHES = {
+    "DataScript": "pbkdf2_sha256$390000$08jDuN2nDkQqZsouo5SzOw==$fir7Eq2iNgP6+MyBTb8A69WetgAJqVo9s90RsOtpbHs=",
+    "Tuning": "pbkdf2_sha256$390000$LLMVvIDSBd+uzT2z/rTmRA==$L0k4JSJtuFowts0oi67RcK5WFazv8TdkpXYXTPkWbvs=",
+    "Drivetest": "pbkdf2_sha256$390000$b71et2LYYSY205+SYJ8v+Q==$pUIT5FootFRvqhycDlRIyQa1UZMf9xiTnKb9gcccFZM=",
+    "Optimization": "pbkdf2_sha256$390000$GBQl7sgn6vxIfXLTSHlRtQ==$PL+/yA7HHaxiTVL5G9ucru0L9gidVessEw6ZCu8iMPk=",
+}
+
 
 def _album_upload_dir(album_name: str) -> str:
     return os.path.join(UPLOAD_DIR, album_name)
 
 
+def _ensure_upload_subdir(folder_name: str) -> str:
+    folder_dir = os.path.join(UPLOAD_DIR, folder_name)
+    os.makedirs(folder_dir, exist_ok=True)
+    return folder_dir
+
+
 def _ensure_album_upload_dir(album_name: str) -> str:
-    album_dir = _album_upload_dir(album_name)
-    os.makedirs(album_dir, exist_ok=True)
-    return album_dir
+    return _ensure_upload_subdir(album_name)
+
+
+def _safe_upload_folder_path(folder: str) -> str:
+    normalized = folder.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+
+    safe_parts: list[str] = []
+    for part in normalized.split("/"):
+        if not part:
+            continue
+        safe_part = os.path.basename(part)
+        if not safe_part or safe_part in (".", "..") or safe_part != part:
+            raise HTTPException(status_code=400, detail="Invalid folder")
+        safe_parts.append(safe_part)
+
+    if not safe_parts:
+        raise HTTPException(status_code=400, detail="Invalid folder")
+    return os.path.join(*safe_parts)
+
+
+def _encode_upload_relative(relative: str) -> str:
+    normalized = relative.replace(os.sep, "/").strip("/")
+    if not normalized:
+        return ""
+    return "/".join(quote(unquote(part), safe="") for part in normalized.split("/"))
+
+
+def _encode_upload_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return url
+
+    if url.startswith(("http://", "https://")):
+        return url
+
+    relative = url.split("?", 1)[0].split("#", 1)[0]
+    for prefix in ("/uploads/", "uploads/"):
+        if relative.startswith(prefix):
+            relative = relative[len(prefix) :]
+            break
+    else:
+        relative = os.path.basename(relative)
+
+    return f"/uploads/{_encode_upload_relative(relative)}"
 
 
 def _resolve_upload_path(url: str) -> str:
@@ -41,14 +107,21 @@ def _resolve_upload_path(url: str) -> str:
             break
     else:
         relative = os.path.basename(relative)
-    return os.path.normpath(os.path.join(UPLOAD_DIR, relative))
+
+    relative = unquote(relative)
+    resolved = os.path.normpath(os.path.join(UPLOAD_DIR, relative))
+    upload_root = os.path.abspath(UPLOAD_DIR)
+    resolved_abs = os.path.abspath(resolved)
+    if os.path.commonpath([upload_root, resolved_abs]) != upload_root:
+        raise HTTPException(status_code=400, detail="Invalid upload path")
+    return resolved_abs
 
 
 def _upload_path_to_url(path: str) -> str:
     absolute_path = os.path.abspath(path)
     upload_root = os.path.abspath(UPLOAD_DIR)
     relative = os.path.relpath(absolute_path, upload_root).replace(os.sep, "/")
-    return f"/uploads/{relative}"
+    return f"/uploads/{_encode_upload_relative(relative)}"
 
 
 def _copy_upload_url_to_dir(url: str, target_dir: str, *, move: bool = False) -> tuple[str, str]:
@@ -59,7 +132,7 @@ def _copy_upload_url_to_dir(url: str, target_dir: str, *, move: bool = False) ->
     filename = os.path.basename(source_path)
     target_path = os.path.join(target_dir, filename)
     if os.path.abspath(source_path) == os.path.abspath(target_path):
-        return url, target_path
+        return _upload_path_to_url(target_path), target_path
 
     if move:
         shutil.move(source_path, target_path)
@@ -67,6 +140,26 @@ def _copy_upload_url_to_dir(url: str, target_dir: str, *, move: bool = False) ->
         shutil.copy2(source_path, target_path)
 
     return _upload_path_to_url(target_path), target_path
+
+
+def _verify_album_password(password: str, stored_hash: str) -> bool:
+    try:
+        scheme, iterations_text, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_text)
+        salt = base64.b64decode(salt_b64)
+        expected_digest = base64.b64decode(digest_b64)
+    except (ValueError, TypeError, binascii.Error):
+        return False
+
+    candidate_digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(candidate_digest, expected_digest)
 
 
 # --- helpers ---
@@ -81,8 +174,8 @@ def _msg_doc_to_response(doc: dict) -> dict:
         "sender_id": str(doc["sender_id"]),
         "receiver_id": str(doc["receiver_id"]),
         "content": doc.get("content"),
-        "media_url": doc.get("media_url"),
-        "thumbnail_url": doc.get("thumbnail_url"),
+        "media_url": _encode_upload_url(doc.get("media_url")),
+        "thumbnail_url": _encode_upload_url(doc.get("thumbnail_url")),
         "status": doc.get("status", "sent"),
         "is_media": doc.get("is_media", False),
         "sent_at": doc["sent_at"],
@@ -98,8 +191,8 @@ def _album_file_to_response(doc: dict) -> dict:
         "id": str(doc["_id"]),
         "album_id": str(doc["album_id"]),
         "filename": doc["filename"],
-        "media_url": doc["media_url"],
-        "thumbnail_url": doc.get("thumbnail_url"),
+        "media_url": _encode_upload_url(doc["media_url"]),
+        "thumbnail_url": _encode_upload_url(doc.get("thumbnail_url")),
         "media_type": doc["media_type"],
         "is_video": doc["is_video"],
         "file_size": doc.get("file_size", 0),
@@ -128,20 +221,24 @@ async def lifespan(app_instance: FastAPI):
         if not existing:
             await users_col.insert_one(seed)
 
-    # Seed albums
-    album_seeds = [
-        {"name": "DataScript", "password": "gogogo"},
-        {"name": "Tuning", "password": "gogogo"},
-        {"name": "Drivetest", "password": "gogogo"},
-        {"name": "Optimization", "password": "gogogo"},
-    ]
-    for album in album_seeds:
-        existing = await albums_col.find_one({"name": album["name"]})
-        if not existing:
-            await albums_col.insert_one(album)
+    # Seed / refresh album passwords using salted hashes.
+    for album_name, password_hash in ALBUM_PASSWORD_HASHES.items():
+        await albums_col.update_one(
+            {"name": album_name},
+            {
+                "$set": {"name": album_name, "password_hash": password_hash},
+                "$unset": {"password": ""},
+            },
+            upsert=True,
+        )
 
     async for album in albums_col.find({}, {"name": 1}):
         _ensure_album_upload_dir(album["name"])
+        _ensure_upload_subdir(os.path.join(album["name"], "thumbnail"))
+
+    for room_folder in CHAT_ROOM_UPLOAD_FOLDERS.values():
+        _ensure_upload_subdir(room_folder)
+        _ensure_upload_subdir(os.path.join(room_folder, "thumbnail"))
     yield
 
 
@@ -275,18 +372,13 @@ async def upload_media(file: UploadFile = File(...), folder: str = ""):
     safe_name = os.path.basename(file.filename)
     if not safe_name:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    if folder == "videos":
-        target_dir = VIDEO_DIR
-    elif folder == "thumbnails":
-        target_dir = THUMB_DIR
-    else:
-        target_dir = UPLOAD_DIR
+
+    safe_folder = _safe_upload_folder_path(folder) if folder else ""
+    target_dir = _ensure_upload_subdir(safe_folder) if safe_folder else UPLOAD_DIR
     filepath = os.path.join(target_dir, safe_name)
     with open(filepath, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    if folder in ("videos", "thumbnails"):
-        return f"/uploads/{folder}/{safe_name}"
-    return f"/uploads/{safe_name}"
+    return _upload_path_to_url(filepath)
 
 
 @app.delete("/messages/{room}/{message_id}")
@@ -322,7 +414,7 @@ async def authenticate_album(payload: AlbumAuth):
     album = await albums_col.find_one({"_id": ObjectId(payload.album_id)})
     if not album:
         raise HTTPException(status_code=404, detail="Album not found")
-    if album["password"] != payload.password:
+    if not _verify_album_password(payload.password, album.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Wrong password")
     return {"ok": True, "album_id": str(album["_id"]), "name": album["name"]}
 
@@ -351,22 +443,23 @@ async def upload_album_file(
         raise HTTPException(status_code=404, detail="Album not found")
 
     album_dir = _ensure_album_upload_dir(album["name"])
+    album_thumb_dir = _ensure_upload_subdir(os.path.join(album["name"], "thumbnail"))
 
     # Save encrypted file inside the album folder.
     safe_name = f"album_{album_id}_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{os.path.basename(file.filename or 'file.enc')}"
     filepath = os.path.join(album_dir, safe_name)
-    media_url = f"/uploads/{album['name']}/{safe_name}"
     with open(filepath, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    media_url = _upload_path_to_url(filepath)
 
     # Save encrypted thumbnail in the same album folder if provided.
     thumbnail_url = None
     if thumbnail:
         thumb_name = f"thumb_{safe_name}"
-        thumb_path = os.path.join(album_dir, thumb_name)
+        thumb_path = os.path.join(album_thumb_dir, thumb_name)
         with open(thumb_path, "wb") as buffer:
             shutil.copyfileobj(thumbnail.file, buffer)
-        thumbnail_url = f"/uploads/{album['name']}/{thumb_name}"
+        thumbnail_url = _upload_path_to_url(thumb_path)
 
     now = datetime.now(timezone.utc)
     doc = {
@@ -414,13 +507,14 @@ async def save_media_to_album(payload: SaveToAlbum):
         raise HTTPException(status_code=404, detail="Album not found")
 
     album_dir = _ensure_album_upload_dir(album["name"])
+    album_thumb_dir = _ensure_upload_subdir(os.path.join(album["name"], "thumbnail"))
 
     media_url, file_path = _copy_upload_url_to_dir(payload.media_url, album_dir)
 
     thumbnail_url = None
     if payload.thumbnail_url:
         try:
-            thumbnail_url, _ = _copy_upload_url_to_dir(payload.thumbnail_url, album_dir)
+            thumbnail_url, _ = _copy_upload_url_to_dir(payload.thumbnail_url, album_thumb_dir)
         except HTTPException:
             thumbnail_url = None
 

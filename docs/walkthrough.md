@@ -51,8 +51,11 @@ The production runtime is the `clickfire` Docker container on Orion. Local edits
   - `messages_testing`
 - Each chat room has its own message collection, and room selection must go through `ROOM_COLLECTIONS` or `get_messages_col(room)`.
 - Album media is stored on disk under `/app/uploads/<AlbumName>/`, using the album names seeded by the backend (`DataScript`, `Tuning`, `Drivetest`, `Optimization`).
+- Album passwords are stored in MongoDB as salted PBKDF2-SHA256 hashes; plaintext passwords are not persisted.
 - `POST /albums/{album_id}/files` writes new uploads directly into that album folder.
 - `POST /save-to-album` copies chat media into the target album folder and stores the new album-local path in MongoDB.
+- Chat media from `private`, `work`, and `testing` is stored under `/app/uploads/Private/`, `/app/uploads/Work/`, and `/app/uploads/Testing/` respectively.
+- `POST /media` accepts a `folder` value for the chat room folder and writes both image/video payloads and video thumbnails into that room folder.
 
 ## API Shape
 

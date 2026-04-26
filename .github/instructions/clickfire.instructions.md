@@ -22,8 +22,10 @@ applyTo:
 - MongoDB runs on Orion in the `clickmongo` container at `orion.rftuning.id:27017`, using the `clickdb` database.
 - All endpoints must stay async. Use cursor-based pagination with ObjectId `_id` cursors only; never fall back to `skip()` for chat history.
 - Keep the room collections isolated: `messages_private`, `messages_work`, and `messages_testing`.
-- Media must remain encrypted end-to-end. The backend stores and serves encrypted blobs only and must never handle media keys or plaintext files.
-- For photos and videos, treat the uploaded file itself as the encrypted payload; do not persist or transform plaintext media, extracted frames, or other unencrypted derivatives.
-- Seeded users are `mici/mi123` and `fufu/fu123`; never hardcode secrets that belong in environment variables.
+- Runtime backend code must keep media encrypted end-to-end. The backend stores and serves encrypted blobs only and must never handle media keys or plaintext files.
+- For photos and videos, treat the uploaded file itself as the encrypted payload in runtime code; do not persist or transform plaintext media, extracted frames, or other unencrypted derivatives.
+- Operator tooling under `tools/` may temporarily decrypt media for maintenance tasks such as thumbnail repair, but it must re-store only encrypted blobs and should never become production logic.
+- Album passwords are stored as salted PBKDF2-SHA256 hashes in MongoDB (`password_hash`). Seed or migrate album passwords by refreshing the hash, not by persisting plaintext `password` values.
+- Seeded users are `mici/mi123` and `fufu/fu123`; keep non-secret constants out of environment variables and never commit plaintext secrets.
 - The main run command is `uvicorn main:app --port 18000 --reload`.
 - When debugging, prefer direct inspection of the host, containers, or MongoDB over speculative changes.
